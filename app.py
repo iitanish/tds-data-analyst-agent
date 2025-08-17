@@ -1,4 +1,3 @@
-
 import os
 import networkx as nx
 import re
@@ -18,12 +17,12 @@ import base64
 import tempfile
 import subprocess
 import logging
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Dict, Any, List
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 
 import requests
@@ -50,16 +49,40 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+LLM_TIMEOUT_SECONDS = 180
 
-LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 180))
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main HTML interface"""
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
+
+
+def parse_keys_and_types(raw_questions: str):
+    """
+    Parses the key/type section from the questions file.
+    Returns:
+        keys_list: list of keys in order
+        type_map: dict key -> casting function
+    """
+    import re
+    pattern = r"-\s*`([^`]+)`\s*:\s*(\w+)"
+    matches = re.findall(pattern, raw_questions)
+    type_map_def = {
+        "number": float,
+        "string": str,
+        "integer": int,
+        "int": int,
+        "float": float
+    }
+    type_map = {key: type_map_def.get(t.lower(), str) for key, t in matches}
+    keys_list = [k for k, _ in matches]
+    return keys_list, type_map
+
 
 # -----------------------------
 # Tools
@@ -68,81 +91,116 @@ LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 180))
 @tool
 def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     """
-    Fetch a URL and return data as a DataFrame (supports HTML tables, CSV, Excel, Parquet, JSON, and plain text).
-    Always returns {"status": "success", "data": [...], "columns": [...]} if fetch works.
+    Universal web/data scraper.
+    Fetches data from any URL: JSON, CSV, Excel, Parquet, DB files, archives, HTML tables, or dynamic JS-rendered pages.
+    Returns a dictionary with status, data, and columns.
     """
-    print(f"Scraping URL: {url}")
+    import os, re, tempfile, requests, pandas as pd, duckdb
+    from io import BytesIO, StringIO
+    from bs4 import BeautifulSoup
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.google.com"
+    }
+
     try:
-        from io import BytesIO, StringIO
-        from bs4 import BeautifulSoup
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.google.com/",
-        }
-
-        resp = requests.get(url, headers=headers, timeout=50)
+        resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         ctype = resp.headers.get("Content-Type", "").lower()
 
-        df = None
+        # JSON
+        if "application/json" in ctype or url.endswith(".json"):
+            df = pd.json_normalize(resp.json())
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- CSV ---
-        if "text/csv" in ctype or url.lower().endswith(".csv"):
+        # CSV
+        if "text/csv" in ctype or url.endswith(".csv"):
             df = pd.read_csv(BytesIO(resp.content))
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- Excel ---
-        elif any(url.lower().endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in ctype:
+        # Excel
+        if any(url.endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in ctype:
             df = pd.read_excel(BytesIO(resp.content))
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- Parquet ---
-        elif url.lower().endswith(".parquet"):
+        # Parquet
+        if url.endswith(".parquet") or "parquet" in ctype:
             df = pd.read_parquet(BytesIO(resp.content))
+            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- JSON ---
-        elif "application/json" in ctype or url.lower().endswith(".json"):
-            try:
-                data = resp.json()
-                df = pd.json_normalize(data)
-            except Exception:
-                df = pd.DataFrame([{"text": resp.text}])
+        # Databases (.db, .duckdb)
+        if url.endswith(".db") or url.endswith(".duckdb"):
+            tmp_path = tempfile.NamedTemporaryFile(delete=False).name
+            with open(tmp_path, "wb") as f:
+                f.write(resp.content)
+            con = duckdb.connect(database=':memory:')
+            con.execute(f"ATTACH '{tmp_path}' AS db")
+            tables = con.execute("SHOW TABLES FROM db").fetchdf()
+            if not tables.empty:
+                table_name = tables.iloc[0, 0]
+                df = con.execute(f"SELECT * FROM db.{table_name}").fetchdf()
+                con.close()
+                os.remove(tmp_path)
+                return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-        # --- HTML / Fallback ---
-        elif "text/html" in ctype or re.search(r'/wiki/|\.org|\.com', url, re.IGNORECASE):
-            html_content = resp.text
-            # Try HTML tables first
-            try:
-                tables = pd.read_html(StringIO(html_content), flavor="bs4")
-                if tables:
-                    df = tables[0]
-            except ValueError:
-                pass
+        # Archives (.tar.gz, .zip)
+        if url.endswith((".tar.gz", ".tgz", ".tar", ".zip")):
+            import tarfile, zipfile
+            content = BytesIO(resp.content)
+            if url.endswith(".zip"):
+                with zipfile.ZipFile(content, 'r') as z:
+                    for name in z.namelist():
+                        if name.endswith(".parquet"):
+                            df = pd.read_parquet(z.open(name))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+                        if name.endswith(".csv"):
+                            df = pd.read_csv(z.open(name))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+            else:
+                with tarfile.open(fileobj=content, mode="r:*") as tar:
+                    for member in tar.getmembers():
+                        if member.name.endswith(".parquet"):
+                            df = pd.read_parquet(tar.extractfile(member))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+                        if member.name.endswith(".csv"):
+                            df = pd.read_csv(tar.extractfile(member))
+                            return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
 
-            # If no table found, fallback to plain text
-            if df is None:
-                soup = BeautifulSoup(html_content, "html.parser")
-                text = soup.get_text(separator="\n", strip=True)
-                df = pd.DataFrame({"text": [text]})
+        # Static HTML tables
+        try:
+            tables = pd.read_html(StringIO(resp.text), flavor="lxml")
+            if tables:
+                df = tables[0]
+                return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+        except Exception:
+            pass
 
-        # --- Unknown type fallback ---
-        else:
-            df = pd.DataFrame({"text": [resp.text]})
+        # Dynamic JS rendering
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, timeout=45000)
+                page.wait_for_load_state("networkidle")
+                html = page.content()
+                browser.close()
+            tables = pd.read_html(StringIO(html), flavor="lxml")
+            if tables:
+                df = tables[0]
+                return {"status": "success", "data": df.to_dict(orient="records"), "columns": list(df.columns)}
+        except Exception:
+            pass
 
-        # --- Normalize columns ---
-        df.columns = df.columns.map(str).str.replace(r'\[.*\]', '', regex=True).str.strip()
-
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": df.columns.tolist()
-        }
+        # Plain text fallback
+        soup = BeautifulSoup(resp.text, "lxml")
+        text = soup.get_text("\n", strip=True)
+        return {"status": "success", "data": [{"text": text}], "columns": ["text"]}
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 
 # -----------------------------
@@ -184,58 +242,77 @@ from typing import Dict, Any
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import re
+from io import StringIO
 
 def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0",
+        "Referer": "https://www.google.com"
+    }
+
     try:
-        response = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5
-        )
-        response.raise_for_status()
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        try:
+            tables = pd.read_html(StringIO(resp.text))
+            if tables:
+                df = tables[0]
+                df.columns = [str(c).strip() for c in df.columns]
+                return {
+                    "status": "success",
+                    "data": df.to_dict(orient="records"),
+                    "columns": list(df.columns)
+                }
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # --- Fallback: use Playwright if direct request fails (e.g., 403) ---
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=45000)
+            page.wait_for_load_state("networkidle")
+            html = page.content()
+            browser.close()
+
+        tables = pd.read_html(StringIO(html))
+        if tables:
+            df = tables[0]
+            df.columns = [str(c).strip() for c in df.columns]
+            return {
+                "status": "success",
+                "data": df.to_dict(orient="records"),
+                "columns": list(df.columns)
+            }
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e),
+            "message": f"Scraping failed (requests+playwright): {str(e)}",
             "data": [],
             "columns": []
         }
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    tables = pd.read_html(response.text)
-
-    if tables:
-        df = tables[0]  # Take first table
-        df.columns = [str(c).strip() for c in df.columns]
-        
-        # Ensure all columns are unique and string
-        df.columns = [str(col) for col in df.columns]
-
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": list(df.columns)
-        }
-    else:
-        # Fallback to plain text
-        text_data = soup.get_text(separator="\n", strip=True)
-
-        # Try to detect possible "keys" from text like Runtime, Genre, etc.
-        detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
-        df = pd.DataFrame([{}])  # start empty
-        for col in detected_cols:
-            df[col] = None
-
-        if df.empty:
-            df["text"] = [text_data]
-
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": list(df.columns)
-        }
+    return {"status": "error", "message": "No tables found", "data": [], "columns": []}
 '''
+def normalize_strptime(sql: str) -> str:
+    # Pattern to find strptime with any first argument
+    pattern = r"strptime\s*\(\s*([^,]+?)\s*,\s*['\"].*?['\"]\s*\)"
+    
+    # Replacement function to wrap the first argument in a CAST to VARCHAR
+    def cast_arg(match):
+        arg = match.group(1).strip()
+        # Only cast if it's a column name (not a string literal or function call)
+        if not (arg.startswith("'") or arg.startswith('"') or '(' in arg):
+            return f"strptime(CAST({arg} AS VARCHAR), "
+        return match.group(0)
+
+    # Use re.sub with a replacement function
+    sql = re.sub(r'strptime\s*\(\s*([^,]+?)\s*,', cast_arg, sql, flags=re.IGNORECASE)
+    
 
 
 def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60) -> Dict[str, Any]:
@@ -258,6 +335,35 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "from io import BytesIO",
         "import base64",
     ]
+    preamble.append("import duckdb, re")
+    preamble.append(r'''
+def normalize_strptime(sql: str) -> str:
+    # Pattern to find strptime with any first argument
+    pattern = r"strptime\\s*\\(\\s*([^,]+?)\\s*,"
+    
+    # Replacement function to wrap the first argument in a CAST to VARCHAR
+    def cast_arg(match):
+        arg = match.group(1).strip()
+        # Only cast if it's a column name (not a string literal or function call)
+        if not (arg.startswith("'") or arg.startswith('"') or '(' in arg):
+            return f"strptime(CAST({arg} AS VARCHAR), "
+        return match.group(0)
+
+    # Use re.sub with a replacement function
+    sql = re.sub(r"strptime\s*\(\s*([^,]+?)\s*,", cast_arg, sql, flags=re.IGNORECASE)
+
+
+    return sql
+
+class SafeDuckDB:
+    def __init__(self, conn):
+        self._conn = conn
+    def execute(self, sql: str):
+        sql = normalize_strptime(sql)
+        return self._conn.execute(sql)
+
+duckdb_conn = SafeDuckDB(duckdb.connect(database=':memory:'))
+''')
     if PIL_AVAILABLE:
         preamble.append("from PIL import Image")
     # inject df if a pickle path provided
@@ -267,53 +373,96 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
     else:
         # ensure data exists so user code that references data won't break
         preamble.append("data = globals().get('data', {})\n")
+    # Ensure df and dfs aliases always exist
+    preamble.append('''
+# Normalise aliases for robustness
+try:
+    import pandas as pd
+except ImportError:
+    pass
+
+# Ensure df exists if possible
+if "df" not in globals() and "data" in globals() and isinstance(data, list):
+    try:
+        df = pd.DataFrame(data)
+    except Exception:
+        df = None
+
+# Ensure dfs alias always exists
+if "df" in globals() and df is not None:
+    dfs = [df]
+else:
+    try:
+        dfs = [pd.DataFrame(data)] if "data" in globals() and isinstance(data, list) else []
+    except Exception:
+        dfs = []
+
+# Ensure scraped_data alias exists
+if "df" in globals() and df is not None:
+    scraped_data = {
+        "status": "success",
+        "data": df.to_dict(orient="records"),
+        "as_dataframe": df
+    }
+elif "data" in globals() and isinstance(data, list):
+    try:
+        scraped_data = {
+            "status": "success",
+            "data": data,
+            "as_dataframe": pd.DataFrame(data) if len(data) > 0 else pd.DataFrame()
+        }
+    except Exception:
+        scraped_data = {"status": "success", "data": data}
+else:
+    scraped_data = {"status": "error", "data": []}
+
+''')
 
     # plot_to_base64 helper that tries to reduce size under 100_000 bytes
     helper = r'''
-def plot_to_base64(max_bytes=100000):
-    buf = BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-    buf.seek(0)
-    img_bytes = buf.getvalue()
-    # if already under limit, return png data uri
-    if len(img_bytes) <= max_bytes:
-        return base64.b64encode(img_bytes).decode('ascii')
-    # try decreasing dpi/figure size iteratively
-    for dpi in [80, 60, 50, 40, 30]:
+    def plot_to_base64(max_bytes=99500):
         buf = BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=dpi)
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
         buf.seek(0)
-        b = buf.getvalue()
-        if len(b) <= max_bytes:
-            return base64.b64encode(b).decode('ascii')
-    # if Pillow available, try convert to WEBP which is typically smaller
-    try:
-        from PIL import Image
+        img_bytes = buf.getvalue()
+        if len(img_bytes) <= max_bytes:
+            return base64.b64encode(img_bytes).decode('ascii')
+        # try decreasing dpi/figure size iteratively
+        for dpi in [80, 60, 50, 40, 30]:
+            buf = BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight', dpi=dpi)
+            buf.seek(0)
+            b = buf.getvalue()
+            if len(b) <= max_bytes:
+                return base64.b64encode(b).decode('ascii')
+        # if Pillow available, try convert to WEBP which is typically smaller
+        try:
+            from PIL import Image
+            buf = BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight', dpi=40)
+            buf.seek(0)
+            im = Image.open(buf)
+            out_buf = BytesIO()
+            im.save(out_buf, format='WEBP', quality=80, method=6)
+            out_buf.seek(0)
+            ob = out_buf.getvalue()
+            if len(ob) <= max_bytes:
+                return base64.b64encode(ob).decode('ascii')
+            # try lower quality
+            out_buf = BytesIO()
+            im.save(out_buf, format='WEBP', quality=60, method=6)
+            out_buf.seek(0)
+            ob = out_buf.getvalue()
+            if len(ob) <= max_bytes:
+                return base64.b64encode(ob).decode('ascii')
+        except Exception:
+            pass
+        # as last resort return downsized PNG even if > max_bytes
         buf = BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=40)
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
         buf.seek(0)
-        im = Image.open(buf)
-        out_buf = BytesIO()
-        im.save(out_buf, format='WEBP', quality=80, method=6)
-        out_buf.seek(0)
-        ob = out_buf.getvalue()
-        if len(ob) <= max_bytes:
-            return base64.b64encode(ob).decode('ascii')
-        # try lower quality
-        out_buf = BytesIO()
-        im.save(out_buf, format='WEBP', quality=60, method=6)
-        out_buf.seek(0)
-        ob = out_buf.getvalue()
-        if len(ob) <= max_bytes:
-            return base64.b64encode(ob).decode('ascii')
-    except Exception:
-        pass
-    # as last resort return a downsized PNG even if > max_bytes
-    buf = BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
-    buf.seek(0)
-    return  base64.b64encode(buf.getvalue()).decode('ascii')
-'''
+        return base64.b64encode(buf.getvalue()).decode('ascii')
+    '''
 
     # Build the code to write
     script_lines = []
@@ -349,8 +498,6 @@ def plot_to_base64(max_bytes=100000):
     finally:
         try:
             os.unlink(tmp_path)
-            if injected_pickle and os.path.exists(injected_pickle):
-                os.unlink(injected_pickle)
         except Exception:
             pass
 
@@ -359,7 +506,7 @@ def plot_to_base64(max_bytes=100000):
 # LLM agent setup
 # -----------------------------
 llm = ChatGoogleGenerativeAI(
-    model=os.getenv("GOOGLE_MODEL", "gemini-2.5-pro"),
+    model= "gemini-2.5-pro",
     temperature=0,
     google_api_key=os.getenv("GOOGLE_API_KEY")
 )
@@ -380,9 +527,8 @@ You must:
 1. Follow the provided rules exactly.
 2. Return only a valid JSON object — no extra commentary or formatting.
 3. The JSON must contain:
-   - "questions":  keys provided in the questions file
-   - "code": "..." (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
-   - "Note" : the type of each answer should match the type it is asked in question file(e.g. int, float, str, boolean ,base64).
+   - "questions": [ list of original question strings exactly as provided ]
+   - "code": "..." (Python code that creates a dict called `results` with each question string as a key and its computed answer as the value)
 4. Your Python code will run in a sandbox with:
    - pandas, numpy, matplotlib available
    - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
@@ -409,121 +555,121 @@ agent_executor = AgentExecutor(
     return_intermediate_steps=False
 )
 
-
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse
-from starlette.datastructures import UploadFile
-import os, json, tempfile
-from io import BytesIO
-import pandas as pd
-import numpy as np
-
-from fastapi import Request, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from io import BytesIO, StringIO
-import tempfile, json
-import pandas as pd
-
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse
-from starlette.datastructures import UploadFile
-import os, json, tempfile
-from io import BytesIO
-import pandas as pd
-import numpy as np
-
+@app.post("/api/")
 @app.post("/api")
 async def analyze_data(request: Request):
     try:
         form = await request.form()
+        questions_file = None
+        data_file = None
 
-        # Collect all uploaded files from the form
-        uploads = []
-        for _, value in form.multi_items():
-            if isinstance(value, UploadFile):
-                uploads.append(value)
+        for key, val in form.items():
+            if hasattr(val, "filename") and val.filename:  # it's a file
+                fname = val.filename.lower()
+                if fname.endswith(".txt") and questions_file is None:
+                    questions_file = val
+                else:
+                    data_file = val
 
-        if not uploads:
-            raise HTTPException(400, "Upload at least one file (.txt questions file is required).")
+        if not questions_file:
+            raise HTTPException(400, "Missing questions file (.txt)")
 
-        # Find exactly one .txt as questions file
-        txt_files = [f for f in uploads if (f.filename or "").lower().endswith(".txt")]
-        if len(txt_files) != 1:
-            raise HTTPException(400, "Exactly one .txt questions file is required.")
-        questions_file = txt_files[0]
         raw_questions = (await questions_file.read()).decode("utf-8")
-
-
-        type_map = {}
-        patterns = [
-            re.compile(r"^\s*-\s*`([^`]+)`\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list with backticks
-            re.compile(r"^\s*-\s*([a-zA-Z0-9_]+)\s*:\s*([a-zA-Z ]+)", re.MULTILINE),  # bullet list no backticks
-            re.compile(r"`([^`]+)`\s*\((number|string|boolean|base64)[s]?\)", re.IGNORECASE),  # inline (type)
-        ]
-
-        for pat in patterns:
-            for match in pat.finditer(raw_questions):
-                key, type_hint = match.groups()
-                norm_type = type_hint.strip().lower()
-                if norm_type in ("number", "float", "int"):
-                    norm_type = "number"
-                elif norm_type in ("string", "str"):
-                    norm_type = "string"
-                elif "base64" in norm_type:
-                    norm_type = "base64"
-                elif norm_type in ("bool", "boolean"):
-                    norm_type = "boolean"
-                type_map[key.strip()] = norm_type
-
-        # Build type note for LLM prompt
-        type_note = "\nNote: The following are the exact expected types for each key based on the questions file:\n"
-        if type_map:
-            for k, t in type_map.items():
-                type_note += f"- {k}: {t}\n"
-        else:
-            type_note += "(No explicit types detected in questions file)\n"
-
-        # All others are candidate datasets
-        data_candidates = [f for f in uploads if f is not questions_file]
+        keys_list, type_map = parse_keys_and_types(raw_questions)
 
         pickle_path = None
         df_preview = ""
         dataset_uploaded = False
 
-        # Try to parse the first valid dataset
-        for data_file in data_candidates:
-            filename = (data_file.filename or "").lower()
-            content = await data_file.read()
-
-            try:
-                if filename.endswith(".csv"):
-                    df = pd.read_csv(BytesIO(content))
-                elif filename.endswith((".xlsx", ".xls")):
-                    df = pd.read_excel(BytesIO(content))
-                elif filename.endswith(".parquet"):
-                    df = pd.read_parquet(BytesIO(content))
-                elif filename.endswith(".json"):
-                    try:
-                        df = pd.read_json(BytesIO(content))
-                    except ValueError:
-                        df = pd.DataFrame(json.loads(content.decode("utf-8")))
-                elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
-                    try:
-                        if PIL_AVAILABLE:
-                            image = Image.open(BytesIO(content))
-                            image = image.convert("RGB")  # ensure RGB format
-                            df = pd.DataFrame({"image": [image]})  # store as a single column DataFrame
-                        else:
-                            raise ValueError("PIL is not available for image processing.")
-                    except Exception as e:
-                        raise ValueError(f"Failed to process image file: {str(e)}")
-                else:
-                    continue  # unsupported type
-            except Exception:
-                continue  # failed parse
-
-            # If parsed successfully
+        if data_file:
             dataset_uploaded = True
+            filename = data_file.filename.lower()
+            content = await data_file.read()
+            from io import BytesIO
+            import duckdb, tempfile, tarfile, zipfile
+
+            df = None
+            duckdb_conn = duckdb.connect(database=':memory:')
+
+            # Handle CSV
+            if filename.endswith(".csv"):
+                df = pd.read_csv(BytesIO(content))
+                duckdb_conn.register("df", df)
+
+            # Handle Excel
+            elif filename.endswith((".xlsx", ".xls")):
+                df = pd.read_excel(BytesIO(content))
+                duckdb_conn.register("df", df)
+
+            # Handle Parquet
+            elif filename.endswith(".parquet"):
+                df = pd.read_parquet(BytesIO(content))
+                duckdb_conn.register("df", df)
+
+            # Handle SQLite / DuckDB
+            elif filename.endswith(".db") or filename.endswith(".duckdb"):
+                tmp_path = tempfile.NamedTemporaryFile(delete=False).name
+                with open(tmp_path, "wb") as f:
+                    f.write(content)
+                duckdb_conn.execute(f"ATTACH '{tmp_path}' AS uploaded_db")
+                tables = duckdb_conn.execute("SHOW TABLES FROM uploaded_db").fetchdf()
+                if not tables.empty:
+                    first_table = tables.iloc[0, 0]
+                    df = duckdb_conn.execute(f"SELECT * FROM uploaded_db.{first_table}").fetchdf()
+
+            # Handle archives
+            elif filename.endswith((".tar.gz", ".tgz", ".tar", ".zip")):
+                content_io = BytesIO(content)
+                if filename.endswith(".zip"):
+                    with zipfile.ZipFile(content_io, 'r') as z:
+                        for name in z.namelist():
+                            if name.endswith(".parquet"):
+                                df = pd.read_parquet(z.open(name))
+                                break
+                            if name.endswith(".csv"):
+                                df = pd.read_csv(z.open(name))
+                                break
+                else:
+                    with tarfile.open(fileobj=content_io, mode="r:*") as tar:
+                        for member in tar.getmembers():
+                            if member.name.endswith(".parquet"):
+                                df = pd.read_parquet(tar.extractfile(member))
+                                break
+                            if member.name.endswith(".csv"):
+                                df = pd.read_csv(tar.extractfile(member))
+                                break
+                if df is not None:
+                    duckdb_conn.register("df", df)
+
+            # Handle JSON
+            elif filename.endswith(".json"):
+                try:
+                    df = pd.read_json(BytesIO(content))
+                except ValueError:
+                    df = pd.DataFrame(json.loads(content.decode("utf-8")))
+                duckdb_conn.register("df", df)
+
+            # Handle images
+            elif filename.endswith((".png", ".jpg", ".jpeg")):
+                if PIL_AVAILABLE:
+                    image = Image.open(BytesIO(content)).convert("RGB")
+                    df = pd.DataFrame({"image": [image]})
+                    duckdb_conn.register("df", df)
+                else:
+                    raise HTTPException(400, "PIL not available for image processing")
+
+            # Handle PDFs
+            elif filename.endswith(".pdf"):
+                from PyPDF2 import PdfReader
+                reader = PdfReader(BytesIO(content))
+                text = "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+                df = pd.DataFrame({"text": [text]})
+                duckdb_conn.register("df", df)
+
+            else:
+                raise HTTPException(400, f"Unsupported data file type: {filename}")
+
+            # Save pickle for LLM code injection
             temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             temp_pkl.close()
             df.to_pickle(temp_pkl.name)
@@ -533,8 +679,8 @@ async def analyze_data(request: Request):
                 f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
                 f"Columns: {', '.join(df.columns.astype(str))}\n"
                 f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
+                f"You can also query the dataset using DuckDB via the variable `duckdb_conn`.\n"
             )
-            break  # only the first valid dataset is used
 
         # Build LLM rules
         if dataset_uploaded:
@@ -544,8 +690,8 @@ async def analyze_data(request: Request):
                 "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
                 "3) Use only the uploaded dataset for answering questions.\n"
                 "4) Produce a final JSON object with keys:\n"
-                '   - "questions": exact keys provided in questions txt file \n'
-                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
+                '   - "questions": [ ... original question strings ... ]\n'
+                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
                 "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
         else:
@@ -553,29 +699,31 @@ async def analyze_data(request: Request):
                 "Rules:\n"
                 "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
                 "2) Produce a final JSON object with keys:\n"
-                '   - "questions": exact keys provided in questions txt file \n'
-                '   - "code": "..."  (Python code that fills `results` with exact type of answer of each question as given in questions file and question keys as keys)\n'
+                '   - "questions": [ ... original question strings ... ]\n'
+                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
                 "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
 
         llm_input = (
             f"{llm_rules}\nQuestions:\n{raw_questions}\n"
-            f"{df_preview if df_preview else ''}\n"
-            f"{type_note}\n"
+            f"{df_preview if df_preview else ''}"
             "Respond with the JSON object only."
         )
 
-        # Run unified agent
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as ex:
-            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path, type_map)
+            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path, keys_list, type_map)
             try:
                 result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
                 raise HTTPException(408, "Processing timeout")
 
         if "error" in result:
-            raise HTTPException(500, detail=result["error"])
+            logger.error(f"Analysis failed: {result['error']}")
+            if keys_list:
+                return JSONResponse({k: "can't find answer" for k in keys_list})
+            else:
+                return JSONResponse({"result": "can't find answer"})
 
         return JSONResponse(content=result)
 
@@ -586,74 +734,127 @@ async def analyze_data(request: Request):
         raise HTTPException(500, detail=str(e))
 
 
-# -----------------------------
-# Runner: orchestrates agent -> pre-scrape inject -> execute
-# -----------------------------
-    
-def run_agent_safely_unified(llm_input: str, pickle_path: str = None, type_map: dict = None) -> Dict:
+def run_agent_safely_unified(
+    llm_input: str,
+    pickle_path: str = None,
+    keys_list=None,
+    type_map=None
+) -> Dict:
     """
-    Runs the LLM agent and executes code.
-    - If pickle_path is provided, injects that DataFrame directly.
-    - If no pickle_path, falls back to scraping when needed.
+    Runs the LLM agent and executes code, with a retry loop for execution errors.
+    - If keys_list is provided and any of its keys are in the result, map to that structure.
+    - Otherwise, return the result as is.
     """
+
+    injected_pickle_path = None
     try:
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
-        if not raw_out:
-            return {"error": "Agent returned no output"}
+        max_retries_total = 4
+        raw_out = ""
+        last_error = None
+        current_llm_input = llm_input
 
-        parsed = clean_llm_output(raw_out)
-        if "error" in parsed:
-            return parsed
+        for attempt in range(1, max_retries_total + 1):
+            # Step 1: Get code from agent
+            response = agent_executor.invoke({"input": current_llm_input})
+            raw_out = (
+                response.get("output")
+                or response.get("final_output")
+                or response.get("text")
+                or ""
+            )
+            if not raw_out:
+                last_error = f"Agent returned no output after {attempt} attempts"
+                continue
 
-        if "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response: {parsed}"}
+            parsed = clean_llm_output(raw_out)
+            if "error" in parsed:
+                last_error = f"JSON parsing failed: {parsed['error']}"
+                continue
+            if "code" not in parsed:
+                last_error = f"Invalid agent response: No 'code' key in {parsed}"
+                continue
 
-        code = parsed["code"]
-        questions = parsed["questions"]
+            code = parsed["code"]
 
-        # If no pickle provided, check if code tries to scrape
-        if pickle_path is None:
-            urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
-            if urls:
-                url = urls[0]
-                tool_resp = scrape_url_to_dataframe(url)
-                if tool_resp.get("status") != "success":
-                    return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-                df = pd.DataFrame(tool_resp["data"])
-                temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-                temp_pkl.close()
-                df.to_pickle(temp_pkl.name)
-                pickle_path = temp_pkl.name
+            # Step 2: Handle data injection (if necessary)
+            if not pickle_path:  # only scrape/inject if no file was provided
+                urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
+                if urls:
+                    url = urls[0]
+                    tool_resp = scrape_url_to_dataframe(url)
+                    if tool_resp.get("status") != "success":
+                        last_error = f"Scrape tool failed: {tool_resp.get('message')}"
+                        continue
+                    df = pd.DataFrame(tool_resp["data"])
+                    temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+                    temp_pkl.close()
+                    df.to_pickle(temp_pkl.name)
+                    injected_pickle_path = temp_pkl.name
+            else:
+                injected_pickle_path = pickle_path
 
-        # Execute code with pickle injection if available
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
-        if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
+            # Step 3: Execute the generated code
+            exec_result = write_and_run_temp_python(
+                code, injected_pickle=injected_pickle_path, timeout=LLM_TIMEOUT_SECONDS
+            )
 
-        results_dict = exec_result.get("result", {})
-        print(f"Results dict: {results_dict}")
-        if type_map:
-            for k, expected in type_map.items():
-                if k not in results_dict:
-                    continue
-                v = results_dict[k]
-                if expected == "number":
-                    try:
-                        num = float(v)
-                        results_dict[k] = int(num) if num.is_integer() else num
-                    except:
-                        results_dict[k] = None
-                elif expected in ("string", "base64"):
-                    results_dict[k] = "" if v is None else str(v)
-                elif expected == "boolean":
-                    results_dict[k] = bool(v)  
-        return results_dict
+                    
+            def strip_data_uri_prefix(val):
+                """Remove data:image/...;base64, prefix from any base64 string"""
+                if isinstance(val, str):
+                    return re.sub(r'^data:image/[a-zA-Z0-9.+-]+;base64,', '', val)
+                return val
+
+            if exec_result.get("status") == "success":
+                raw_results = exec_result.get("result", {})
+                results_dict = {k: strip_data_uri_prefix(v) for k, v in raw_results.items()}
+                if keys_list and type_map:
+                    mapped = {}
+                    questions = parsed.get("questions", [])
+                    for idx, question in enumerate(questions):
+                        if idx < len(keys_list):
+                            key = keys_list[idx]
+                            caster = type_map.get(key, str)
+                            val = results_dict.get(question)
+                            try:
+                                mapped[key] = (
+                                    caster(val) if val not in (None, "") else val
+                                )
+                            except Exception:
+                                mapped[key] = val
+                    return mapped
+                return results_dict
+            else:
+                # Step 4: Execution failed. Retry with error feedback
+                last_error = f"Execution failed: {exec_result.get('message')}"
+                current_llm_input = (
+                    f"Previous attempt's Python code failed with the following error:\n"
+                    f"---CODE START---\n{code}\n---CODE END---\n"
+                    f"---ERROR START---\n{exec_result.get('message')}\n---ERROR END---\n"
+                    f"Please generate a new, corrected Python code to answer the questions."
+                )
+  # If we reach here → all retries failed
+        logger.error(f"Final failure after retries: {last_error}")
+        if keys_list:
+            return {k: "can't find answer" for k in keys_list}
+        else:
+            return {"result": "can't find answer"}
 
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
-        return {"error": str(e)}
-    
+        if keys_list:
+            return {k: "can't find answer" for k in keys_list}
+        else:
+            return {"result": "can't find answer"}
+
+    finally:
+        for p in {pickle_path, injected_pickle_path}:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+                
 from fastapi.responses import FileResponse, Response
 import base64, os
 
@@ -685,4 +886,3 @@ async def analyze_get_info():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-
