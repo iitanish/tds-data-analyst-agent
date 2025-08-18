@@ -420,7 +420,7 @@ else:
 
     # plot_to_base64 helper that tries to reduce size under 100_000 bytes
     helper = r'''
-    def plot_to_base64(max_bytes=99500):
+    def plot_to_base64(max_bytes=95000):
         buf = BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
         buf.seek(0)
@@ -531,7 +531,7 @@ You must:
    - "code": "..." (Python code that creates a dict called `results` with each question string as a key and its computed answer as the value)
 4. Your Python code will run in a sandbox with:
    - pandas, numpy, matplotlib available
-   - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
+   - A helper function `plot_to_base64(max_bytes=95000)` for generating base64-encoded images under 95KB.
 5. When returning plots, always use `plot_to_base64()` to keep image sizes small.
 6. Make sure all variables are defined before use, and the code can run without any undefined references.
 """),
@@ -692,7 +692,7 @@ async def analyze_data(request: Request):
                 "4) Produce a final JSON object with keys:\n"
                 '   - "questions": [ ... original question strings ... ]\n'
                 '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
-                "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+                "5) For plots: use plot_to_base64() helper to return base64 image data under 95kB.\n"
             )
         else:
             llm_rules = (
@@ -701,7 +701,7 @@ async def analyze_data(request: Request):
                 "2) Produce a final JSON object with keys:\n"
                 '   - "questions": [ ... original question strings ... ]\n'
                 '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
-                "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+                "3) For plots: use plot_to_base64() helper to return base64 image data under 95kB.\n"
             )
 
         llm_input = (
